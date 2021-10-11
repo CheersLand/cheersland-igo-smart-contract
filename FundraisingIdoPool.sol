@@ -39,6 +39,10 @@ contract FundraisingIdoPool is Auth {
 
     uint256 public whiteListQuota;
 
+    bool public claimLock;
+
+    bool public ownerClaimLock;
+
     mapping(uint8 => uint256) public exchangeRate;
 
     mapping(address => uint256) public upperLimit;
@@ -71,9 +75,7 @@ contract FundraisingIdoPool is Auth {
 
     event Claim(address indexed user, uint256 obtain, uint256 investment, uint256 exchange, uint256 retrievable);
 
-    event OwnerClaim(address indexed user, uint256 amount);
-
-    event ExtractSurplusLp(address indexed user, uint256 lpBalance);
+    event OwnerClaim(address indexed user, uint256 amount, uint256 lpBalance);
 
 
     constructor(
@@ -89,13 +91,16 @@ contract FundraisingIdoPool is Auth {
         uint256 _whiteListQuota,
         uint256 _threshold
     ) public {
+        require(_admin != address(0), "Admin address cannot be 0!");
         _adminAddress = _admin;
+        require(_lpAddress != address(0), "LP address cannot be 0!");
         lpAddress = _lpAddress;
         totalIssuance = _totalIssuance;
         lpQuantitySold = _price.mul(_totalFundRaising).mul(1e18);
         startTime = _startTime;
         endTime = _endTime;
         claimTime = _claimTime;
+        require(_fundRaisingAddress != address(0), "Fund raising address cannot be 0!");
         fundRaisingAddress = _fundRaisingAddress;
         totalFundRaising = _totalFundRaising.mul(1e18);
         whiteListQuota = _whiteListQuota.mul(1e18);
@@ -104,11 +109,27 @@ contract FundraisingIdoPool is Auth {
         threshold = _threshold.mul(1e18);
     }
 
+    modifier inspectLock() {
+        require(!claimLock, "Lock occupied!");
+        claimLock = true;
+        _;
+        claimLock = false;
+    }
+
+    modifier inspectOwnerLock() {
+        require(!ownerClaimLock, "Lock occupied!");
+        ownerClaimLock = true;
+        _;
+        ownerClaimLock = false;
+    }
+
     function setPoolAddress(address _pool) public onlyOperator {
+        require(_pool != address(0), "Pool address cannot be 0!");
         poolAddress = _pool;
     }
 
     function setAdminAddress(address _admin) public onlyOperator {
+        require(_admin != address(0), "Admin address cannot be 0!");
         _adminAddress = _admin;
     }
 
@@ -133,7 +154,11 @@ contract FundraisingIdoPool is Auth {
         claimTime = _claimTime;
     }
 
-    function addSuperWhiteList(address[] memory _accounts, uint256[] memory _quotas) public onlyOperator {
+    function setThreshold(uint256 _threshold) public onlyOperator {
+        threshold = _threshold;
+    }
+
+    function addSuperWhiteList(address[] calldata _accounts, uint256[] calldata _quotas) external onlyOperator {
         require(_accounts.length > 0 && _quotas.length > 0, "The number of whitelists added cannot be 0!");
         require(_accounts.length == _quotas.length, "The number of white lists added and the number of quotas are not equal!");
 
@@ -210,12 +235,12 @@ contract FundraisingIdoPool is Auth {
         totalAmountInvested = totalAmountInvested.add(_amount);
         userIdoInfo[msg.sender].investment = userIdoInfo[msg.sender].investment.add(_amount);
 
-        IERC20(fundRaisingAddress).transferFrom(msg.sender, address(this), _amount);
+        IERC20(fundRaisingAddress).safeTransferFrom(msg.sender, address(this), _amount);
 
         emit ParticipateExchange(msg.sender, _amount);
     }
 
-    function claim() public {
+    function claim() public inspectLock {
         require(block.timestamp >= claimTime, "Claim time not reached!");
         require(!userIsClaim[msg.sender], "You have received the reward!");
 
@@ -237,10 +262,10 @@ contract FundraisingIdoPool is Auth {
         ) = getExchangeInfo(msg.sender);
 
         if (obtain > 0) {
-            IERC20(lpAddress).transfer(msg.sender, obtain);
+            IERC20(lpAddress).safeTransfer(msg.sender, obtain);
         }
         if (retrievable > 0) {
-            IERC20(fundRaisingAddress).transfer(msg.sender, retrievable);
+            IERC20(fundRaisingAddress).safeTransfer(msg.sender, retrievable);
         }
 
         userIsClaim[msg.sender] = true;
@@ -248,34 +273,31 @@ contract FundraisingIdoPool is Auth {
         emit Claim(msg.sender, obtain, userIdoInfo[msg.sender].investment, exchange, retrievable);
     }
 
-    function ownerClaim() public onlyOperator {
+    function ownerClaim() public onlyOperator inspectOwnerLock {
         require(block.timestamp >= claimTime, "Claim time not reached!");
         require(msg.sender == _adminAddress, "You do not have administrator privileges!");
         require(!userIsClaim[msg.sender], "You have received the reward!");
 
+        uint256 lpBalance = 0;
+
         if (totalAmountInvested < totalFundRaising) {
             availableLimit = totalAmountInvested;
+
+            lpBalance = lpQuantitySold.sub(totalAmountInvested.mul(exchangeRate[2]));
+            if (lpBalance > 0) {
+                IERC20(lpAddress).safeTransfer(msg.sender, lpBalance);
+            }
         } else {
             availableLimit = totalFundRaising;
         }
 
         if (availableLimit > 0) {
-            IERC20(fundRaisingAddress).transfer(msg.sender, availableLimit);
+            IERC20(fundRaisingAddress).safeTransfer(msg.sender, availableLimit);
         }
 
         userIsClaim[msg.sender] = true;
 
-        emit OwnerClaim(msg.sender, availableLimit);
-    }
-
-    function extractSurplusLp() public onlyOperator {
-        require(block.timestamp >= claimTime, "Claim time not reached!");
-
-        uint256 lpBalance = IERC20(lpAddress).balanceOf(address(this));
-        if (lpBalance > 0) {
-            IERC20(lpAddress).transfer(msg.sender, lpBalance);
-        }
-        emit ExtractSurplusLp(msg.sender, lpBalance);
+        emit OwnerClaim(msg.sender, availableLimit, lpBalance);
     }
 
     function getPoolMortgage(address _account) public view returns (uint256) {
@@ -392,8 +414,8 @@ contract FundraisingIdoPool is Auth {
         );
     }
 
-    function remainingTime(uint8 timeType) public view returns (uint256) {
-        if (timeType == 0) {
+    function remainingTime(uint8 _timeType) public view returns (uint256) {
+        if (_timeType == 0) {
             if (startTime > 0 && block.timestamp <= startTime) {
                 return startTime.sub(block.timestamp);
             } else {
